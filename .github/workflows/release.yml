@@ -1,7 +1,8 @@
 name: Build and Release
 
-# 推送(或合并后打)以 v 开头的 tag 时触发,用该 tag 名作为版本号打包并发布 release。
-# 也支持手动触发:填一个版本号,会用它创建 tag 并发布。
+# Triggered when a tag starting with "v" is pushed; the tag name is used as the
+# version to package and publish a release.
+# Also supports manual dispatch: provide a version and it creates the tag and release.
 on:
   push:
     tags:
@@ -9,59 +10,66 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号(如 v3.1.11),会用它创建 tag 并发布 release'
+        description: 'Version (e.g. v3.1.11); used to create the tag and publish the release'
         required: true
 
-# 同一 tag 只跑一个发布流程
+# Only one release run at a time per tag
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
-  contents: write   # 创建 release / tag、上传产物需要写权限
+  contents: write   # needed to create release / tag and upload assets
 
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
-      # 固定的 zk_STARK_Validator_V2 产物(v3.1.0)所在的源 release tag。
-      # 这四个文件从 v3.1.0 起内容不变,直接从该 release 下载复用。
+      # Source release tag holding the fixed zk_STARK_Validator_V2 (v3.1.0) artifacts.
+      # These four files have not changed since v3.1.0; reuse them by downloading.
       ZK_SOURCE_TAG: v3.1.0
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0      # 拉全历史,生成发布说明的 git log 需要
-          fetch-tags: true    # 拉全 tag,用于计算上一个版本 / changelog 范围
+          fetch-depth: 0      # full history needed for the release-notes git log
+          fetch-tags: true    # all tags needed to compute previous version / changelog range
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          # go.mod 声明 go 1.17,但依赖用到了 net/netip(需 1.18+),故固定较新版本
+          # go.mod declares go 1.17, but dependencies use net/netip (needs 1.18+), so pin a newer version
           go-version: '1.23'
 
-      - name: 确定版本号与上一个版本
+      - name: Resolve version and previous version
         id: version
+        env:
+          # Bind context values to env vars so they are never interpolated into
+          # the shell command string (prevents script injection via crafted
+          # tag names or dispatch inputs).
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "push" ]; then
-            VERSION="${{ github.ref_name }}"        # tag 触发:直接用 tag 名
-            echo "由 tag 触发,版本号 = $VERSION"
+          if [ "$EVENT_NAME" = "push" ]; then
+            VERSION="$REF_NAME"        # tag-triggered: use the tag name
+            echo "Triggered by tag, version = $VERSION"
           else
-            VERSION="${{ github.event.inputs.version }}"   # 手动触发:用输入的版本号
-            echo "手动触发,版本号 = $VERSION"
+            VERSION="$INPUT_VERSION"   # manual: use the provided version
+            echo "Manual dispatch, version = $VERSION"
           fi
-          # 取当前最新 release 作为上一个版本(用于 changelog)
+          # Latest existing release is treated as the previous version (for the changelog)
           PREV="$(gh release view --json tagName -q .tagName 2>/dev/null || true)"
-          # 已存在同名 release 则报错退出,避免覆盖
+          # Fail if a release with this version already exists, to avoid overwriting
           if gh release view "$VERSION" >/dev/null 2>&1; then
-            echo "::error::release $VERSION 已存在,请换一个版本号" && exit 1
+            echo "::error::release $VERSION already exists, please use a different version" && exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "prev=$PREV" >> "$GITHUB_OUTPUT"
 
-      - name: 生成发布说明
+      - name: Generate release notes
         env:
           VERSION: ${{ steps.version.outputs.version }}
           PREV: ${{ steps.version.outputs.prev }}
@@ -82,13 +90,13 @@ jobs:
               git log -n 20 --no-merges --pretty='- %h %s'
             fi
           } > RELEASE_NOTES.md
-          echo "---- 发布说明预览 ----"
+          echo "---- release notes preview ----"
           cat RELEASE_NOTES.md
 
-      - name: 编译四个平台产物
+      - name: Build artifacts for four platforms
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          GOFLAGS: -mod=mod   # 仓库未提交 go.sum,允许 build 时自动下载依赖并补齐
+          GOFLAGS: -mod=readonly   # go.sum is committed; fail the build if deps drift from the lock file
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -106,16 +114,16 @@ jobs:
           build linux   amd64 "proof-of-reserves-linux-amd64-${VERSION}" ""
           build windows amd64 "proof-of-reserves-windows-${VERSION}"     ".exe"
 
-      - name: 下载固定的 zk_STARK_Validator_V2 产物
+      - name: Download fixed zk_STARK_Validator_V2 artifacts
         run: |
           set -euo pipefail
           gh release download "$ZK_SOURCE_TAG" \
             --repo "${{ github.repository }}" \
             --pattern 'zk_STARK_Validator_V2_*.zip' \
             --dir dist
-          echo "已下载 zk 产物:" && ls -1 dist/zk_STARK_Validator_V2_*.zip
+          echo "Downloaded zk artifacts:" && ls -1 dist/zk_STARK_Validator_V2_*.zip
 
-      - name: 创建 Release 并上传全部产物
+      - name: Create release and upload all artifacts
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
