@@ -38,7 +38,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # go.mod 声明 go 1.17,但依赖用到了 net/netip(需 1.18+),故固定较新版本
+          go-version: '1.23'
 
       - name: 确定版本号与上一个版本
         id: version
