@@ -81,5 +81,4 @@ require (
 require (
 	github.com/lestrrat-go/strftime v1.0.6 // indirect
 	github.com/schollz/progressbar/v3 v3.13.1
-	github.com/stretchr/testify v1.8.4 // indirect
 )
