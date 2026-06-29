@@ -1,18 +1,18 @@
 name: Build and Release
 
-# 每次合并(push)到 main 自动构建并发布一个新 release。
-# 也支持手动触发,可指定版本号(留空则自动在最新 release 的 patch 位 +1)。
+# 推送(或合并后打)以 v 开头的 tag 时触发,用该 tag 名作为版本号打包并发布 release。
+# 也支持手动触发:填一个版本号,会用它创建 tag 并发布。
 on:
   push:
-    branches: [main]
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       version:
-        description: '发布版本号(如 v3.1.11)。留空则自动在最新 release 基础上 patch +1'
-        required: false
-        default: ''
+        description: '版本号(如 v3.1.11),会用它创建 tag 并发布 release'
+        required: true
 
-# 同一时刻只跑一个发布流程,避免快速连续合并时 tag/release 冲突
+# 同一 tag 只跑一个发布流程
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -31,44 +31,63 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      # 拉全历史,生成发布说明的 git log 需要
+          fetch-tags: true    # 拉全 tag,用于计算上一个版本 / changelog 范围
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
-      - name: 计算发布版本号
+      - name: 确定版本号与上一个版本
         id: version
         run: |
           set -euo pipefail
-          INPUT="${{ github.event.inputs.version }}"
-          if [ -n "$INPUT" ]; then
-            VERSION="$INPUT"
-            echo "使用手动指定版本: $VERSION"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            VERSION="${{ github.ref_name }}"        # tag 触发:直接用 tag 名
+            echo "由 tag 触发,版本号 = $VERSION"
           else
-            # 取当前最新 release 的 tag,patch 位 +1
-            LATEST="$(gh release view --json tagName -q .tagName 2>/dev/null || true)"
-            if [ -z "$LATEST" ]; then
-              LATEST="v3.1.10"
-              echo "未找到已有 release,以 $LATEST 为基准"
-            fi
-            BASE="${LATEST#v}"                       # 去掉前缀 v
-            MAJOR="$(echo "$BASE" | cut -d. -f1)"
-            MINOR="$(echo "$BASE" | cut -d. -f2)"
-            PATCH="$(echo "$BASE" | cut -d. -f3)"
-            PATCH=$((PATCH + 1))
-            VERSION="v${MAJOR}.${MINOR}.${PATCH}"
-            echo "最新 release=$LATEST,自动升级为 $VERSION"
+            VERSION="${{ github.event.inputs.version }}"   # 手动触发:用输入的版本号
+            echo "手动触发,版本号 = $VERSION"
           fi
-          # tag 已存在则报错退出(避免覆盖历史版本)
+          # 取当前最新 release 作为上一个版本(用于 changelog)
+          PREV="$(gh release view --json tagName -q .tagName 2>/dev/null || true)"
+          # 已存在同名 release 则报错退出,避免覆盖
           if gh release view "$VERSION" >/dev/null 2>&1; then
-            echo "::error::release $VERSION 已存在,请手动指定一个新版本号" && exit 1
+            echo "::error::release $VERSION 已存在,请换一个版本号" && exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "prev=$PREV" >> "$GITHUB_OUTPUT"
+
+      - name: 生成发布说明
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PREV: ${{ steps.version.outputs.prev }}
+        run: |
+          set -euo pipefail
+          {
+            if [ -n "$PREV" ]; then
+              echo "Changes since ${PREV}."
+              echo
+              echo "Changes:"
+              git log "${PREV}..HEAD" --no-merges --pretty='- %h %s'
+              echo
+              echo "**Full Changelog**: ${{ github.server_url }}/${{ github.repository }}/compare/${PREV}...${VERSION}"
+            else
+              echo "Release ${VERSION}."
+              echo
+              echo "Changes:"
+              git log -n 20 --no-merges --pretty='- %h %s'
+            fi
+          } > RELEASE_NOTES.md
+          echo "---- 发布说明预览 ----"
+          cat RELEASE_NOTES.md
 
       - name: 编译四个平台产物
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          GOFLAGS: -mod=mod   # 仓库未提交 go.sum,允许 build 时自动下载依赖并补齐
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -81,9 +100,9 @@ jobs:
             zip -r "dist/${outdir}.zip" "${outdir}"
           }
 
-          build darwin amd64 "proof-of-reserves-macos-${VERSION}"        ""
-          build linux  arm64 "proof-of-reserves-linux-arm64-${VERSION}"  ""
-          build linux  amd64 "proof-of-reserves-linux-amd64-${VERSION}"  ""
+          build darwin  amd64 "proof-of-reserves-macos-${VERSION}"       ""
+          build linux   arm64 "proof-of-reserves-linux-arm64-${VERSION}" ""
+          build linux   amd64 "proof-of-reserves-linux-amd64-${VERSION}" ""
           build windows amd64 "proof-of-reserves-windows-${VERSION}"     ".exe"
 
       - name: 下载固定的 zk_STARK_Validator_V2 产物
@@ -104,7 +123,7 @@ jobs:
             --repo "${{ github.repository }}" \
             --target "${{ github.sha }}" \
             --title "$VERSION" \
-            --generate-notes \
+            --notes-file RELEASE_NOTES.md \
             dist/proof-of-reserves-linux-amd64-"$VERSION".zip \
             dist/proof-of-reserves-linux-arm64-"$VERSION".zip \
             dist/proof-of-reserves-macos-"$VERSION".zip \
