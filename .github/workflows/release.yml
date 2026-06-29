@@ -1,0 +1,115 @@
+name: Build and Release
+
+# 每次合并(push)到 main 自动构建并发布一个新 release。
+# 也支持手动触发,可指定版本号(留空则自动在最新 release 的 patch 位 +1)。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '发布版本号(如 v3.1.11)。留空则自动在最新 release 基础上 patch +1'
+        required: false
+        default: ''
+
+# 同一时刻只跑一个发布流程,避免快速连续合并时 tag/release 冲突
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 创建 release / tag、上传产物需要写权限
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # 固定的 zk_STARK_Validator_V2 产物(v3.1.0)所在的源 release tag。
+      # 这四个文件从 v3.1.0 起内容不变,直接从该 release 下载复用。
+      ZK_SOURCE_TAG: v3.1.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: 计算发布版本号
+        id: version
+        run: |
+          set -euo pipefail
+          INPUT="${{ github.event.inputs.version }}"
+          if [ -n "$INPUT" ]; then
+            VERSION="$INPUT"
+            echo "使用手动指定版本: $VERSION"
+          else
+            # 取当前最新 release 的 tag,patch 位 +1
+            LATEST="$(gh release view --json tagName -q .tagName 2>/dev/null || true)"
+            if [ -z "$LATEST" ]; then
+              LATEST="v3.1.10"
+              echo "未找到已有 release,以 $LATEST 为基准"
+            fi
+            BASE="${LATEST#v}"                       # 去掉前缀 v
+            MAJOR="$(echo "$BASE" | cut -d. -f1)"
+            MINOR="$(echo "$BASE" | cut -d. -f2)"
+            PATCH="$(echo "$BASE" | cut -d. -f3)"
+            PATCH=$((PATCH + 1))
+            VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+            echo "最新 release=$LATEST,自动升级为 $VERSION"
+          fi
+          # tag 已存在则报错退出(避免覆盖历史版本)
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "::error::release $VERSION 已存在,请手动指定一个新版本号" && exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: 编译四个平台产物
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          build() {
+            local goos="$1" goarch="$2" outdir="$3" ext="$4"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -o "${outdir}/CheckBalance${ext}" cmd/checkbalance/main.go
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -o "${outdir}/VerifyAddress${ext}" cmd/verifyaddress/main.go
+            cp example/rpc.json "${outdir}/rpc.json"
+            zip -r "dist/${outdir}.zip" "${outdir}"
+          }
+
+          build darwin amd64 "proof-of-reserves-macos-${VERSION}"        ""
+          build linux  arm64 "proof-of-reserves-linux-arm64-${VERSION}"  ""
+          build linux  amd64 "proof-of-reserves-linux-amd64-${VERSION}"  ""
+          build windows amd64 "proof-of-reserves-windows-${VERSION}"     ".exe"
+
+      - name: 下载固定的 zk_STARK_Validator_V2 产物
+        run: |
+          set -euo pipefail
+          gh release download "$ZK_SOURCE_TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern 'zk_STARK_Validator_V2_*.zip' \
+            --dir dist
+          echo "已下载 zk 产物:" && ls -1 dist/zk_STARK_Validator_V2_*.zip
+
+      - name: 创建 Release 并上传全部产物
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "$VERSION" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "$VERSION" \
+            --generate-notes \
+            dist/proof-of-reserves-linux-amd64-"$VERSION".zip \
+            dist/proof-of-reserves-linux-arm64-"$VERSION".zip \
+            dist/proof-of-reserves-macos-"$VERSION".zip \
+            dist/proof-of-reserves-windows-"$VERSION".zip \
+            dist/zk_STARK_Validator_V2_aarch64-apple-darwin_v3.1.0.zip \
+            dist/zk_STARK_Validator_V2_x86_64-apple-darwin_v3.1.0.zip \
+            dist/zk_STARK_Validator_V2_x86_64-pc-windows-gnu_v3.1.0.zip \
+            dist/zk_STARK_Validator_V2_x86_64-unknown-linux-gnu_v3.1.0.zip
